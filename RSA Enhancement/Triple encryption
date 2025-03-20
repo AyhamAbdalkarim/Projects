@@ -1,0 +1,404 @@
+import os
+import sqlite3
+import math
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+import binascii
+import hashlib
+from Crypto.Util.number import getPrime, inverse, long_to_bytes, bytes_to_long
+from Crypto.Cipher import PKCS1_OAEP, AES, DES3
+from Crypto.PublicKey import RSA
+from Crypto.Hash import SHA256
+
+# ✅ Database Setup
+DB_FILE = "secure_keys.db"
+EXCEL_FILE = "secure_keys.xlsx"
+AES_KEY = os.urandom(16)  # AES-128 Key for encrypting RSA keys
+
+# ✅ Initialize Database with hash columns and sequential encryption
+def initialize_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Drop the existing table if it exists
+    cursor.execute("DROP TABLE IF EXISTS rsa_keys")
+    
+    # Create a new table with all the required columns
+    cursor.execute("""
+        CREATE TABLE rsa_keys (
+            id INTEGER PRIMARY KEY,
+            n BLOB,
+            e BLOB,
+            d BLOB,
+            p BLOB,
+            q BLOB,
+            n_hash TEXT,
+            e_hash TEXT,
+            d_hash TEXT,
+            p_hash TEXT,
+            q_hash TEXT,
+            message_hash TEXT,
+            original_message BLOB,
+            rsa_encrypted BLOB,
+            rsa_des3_encrypted BLOB,
+            rsa_des3_aes_encrypted BLOB,
+            des3_key BLOB,
+            des3_iv BLOB,
+            aes_key BLOB,
+            aes_nonce BLOB,
+            aes_tag BLOB
+        )
+    """)
+    conn.commit()
+    conn.close()
+    
+    print("Database initialized with new sequential encryption schema")
+
+# ✅ Compute SHA-256 Hash
+def compute_hash(data):
+    """Compute SHA-256 hash of the data"""
+    if isinstance(data, int):
+        data = long_to_bytes(data)
+    return hashlib.sha256(data).hexdigest()
+
+# ✅ AES Encryption for Secure Key Storage
+def aes_encrypt(data, key):
+    cipher = AES.new(key, AES.MODE_EAX)
+    ciphertext, tag = cipher.encrypt_and_digest(data)
+    return cipher.nonce + tag + ciphertext  # Store nonce, tag, and encrypted data together
+
+# ✅ AES Decryption
+def aes_decrypt(data, key):
+    nonce, tag, ciphertext = data[:16], data[16:32], data[32:]
+    cipher = AES.new(key, AES.MODE_EAX, nonce=nonce)
+    return cipher.decrypt_and_verify(ciphertext, tag)
+
+# ✅ 3DES Encryption
+def des3_encrypt(data):
+    """Encrypt data using 3DES"""
+    # Generate a random 24-byte key for 3DES (8-byte blocks, 3 keys)
+    des3_key = os.urandom(24)
+    # Generate a random IV
+    iv = os.urandom(8)
+    # Create 3DES cipher object
+    cipher = DES3.new(des3_key, DES3.MODE_CBC, iv)
+    
+    # Pad data to be a multiple of 8 bytes (3DES block size)
+    pad_len = 8 - (len(data) % 8)
+    padded_data = data + bytes([pad_len]) * pad_len
+    
+    # Encrypt data
+    ciphertext = cipher.encrypt(padded_data)
+    
+    return des3_key, iv, ciphertext
+
+# ✅ 3DES Decryption
+def des3_decrypt(ciphertext, key, iv):
+    """Decrypt data using 3DES"""
+    cipher = DES3.new(key, DES3.MODE_CBC, iv)
+    padded_plaintext = cipher.decrypt(ciphertext)
+    
+    # Remove PKCS#7 padding
+    pad_len = padded_plaintext[-1]
+    return padded_plaintext[:-pad_len]
+
+# ✅ Generate and Store RSA Keys Securely with Hashes
+def generate_and_store_rsa_key(message=None):
+    """Generate RSA keys, compute hashes, and securely store them in the database with AES encryption."""
+    p = getPrime(1024)  
+    q = getPrime(1024)  
+    n = p * q
+    lambda_n = (p - 1) * (q - 1) // math.gcd(p - 1, q - 1)  
+    e = 65537  
+    d = inverse(e, lambda_n)  
+
+    # Compute hashes of the RSA parameters
+    n_hash = compute_hash(n)
+    e_hash = compute_hash(e)
+    d_hash = compute_hash(d)
+    p_hash = compute_hash(p)
+    q_hash = compute_hash(q)
+    
+    # Initialize message-related variables
+    message_hash = None
+    rsa_encrypted = None
+    rsa_des3_encrypted = None
+    rsa_des3_aes_encrypted = None
+    des3_key = None
+    des3_iv = None
+    aes_key = None
+    aes_nonce = None
+    aes_tag = None
+    
+    # Process message if provided
+    if message:
+        message_hash = compute_hash(message)
+        
+        # Step 1: RSA encryption
+        rsa_key = RSA.construct((n, e))
+        cipher = PKCS1_OAEP.new(rsa_key)
+        rsa_encrypted = cipher.encrypt(message)
+        
+        # Step 2: 3DES encryption of the RSA encrypted message
+        des3_key, des3_iv, des3_ciphertext = des3_encrypt(rsa_encrypted)
+        rsa_des3_encrypted = des3_ciphertext
+        
+        # Step 3: AES encryption of the 3DES encrypted message
+        aes_key = os.urandom(16)
+        aes_cipher = AES.new(aes_key, AES.MODE_EAX)
+        aes_ciphertext, aes_tag = aes_cipher.encrypt_and_digest(des3_ciphertext)
+        aes_nonce = aes_cipher.nonce
+        rsa_des3_aes_encrypted = aes_ciphertext
+
+    # Encrypt keys before storing
+    encrypted_n = aes_encrypt(long_to_bytes(n), AES_KEY)
+    encrypted_e = aes_encrypt(long_to_bytes(e), AES_KEY)
+    encrypted_d = aes_encrypt(long_to_bytes(d), AES_KEY)
+    encrypted_p = aes_encrypt(long_to_bytes(p), AES_KEY)
+    encrypted_q = aes_encrypt(long_to_bytes(q), AES_KEY)
+
+    # Store in SQLite with hashes
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO rsa_keys 
+        (n, e, d, p, q, n_hash, e_hash, d_hash, p_hash, q_hash, message_hash, original_message, 
+         rsa_encrypted, rsa_des3_encrypted, rsa_des3_aes_encrypted, des3_key, des3_iv, aes_key, aes_nonce, aes_tag) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (encrypted_n, encrypted_e, encrypted_d, encrypted_p, encrypted_q, 
+          n_hash, e_hash, d_hash, p_hash, q_hash, 
+          message_hash, message, rsa_encrypted, rsa_des3_encrypted, rsa_des3_aes_encrypted,
+          des3_key, des3_iv, aes_key, aes_nonce, aes_tag))
+    key_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    
+    # Export to Excel
+    export_keys_to_excel(key_id, encrypted_n, encrypted_e, encrypted_d, encrypted_p, encrypted_q, 
+                         n_hash, e_hash, d_hash, p_hash, q_hash, message_hash)
+    
+    return key_id, n, e, d, p, q
+
+# ✅ Export Keys to Excel with Hashes
+def export_keys_to_excel(key_id, encrypted_n, encrypted_e, encrypted_d, encrypted_p, encrypted_q, 
+                         n_hash, e_hash, d_hash, p_hash, q_hash, message_hash):
+    """Export encrypted keys and their hashes to Excel for viewing"""
+    # Convert binary data to hex for display
+    hex_n = binascii.hexlify(encrypted_n).decode('utf-8')
+    hex_e = binascii.hexlify(encrypted_e).decode('utf-8')
+    hex_d = binascii.hexlify(encrypted_d).decode('utf-8')
+    hex_p = binascii.hexlify(encrypted_p).decode('utf-8')
+    hex_q = binascii.hexlify(encrypted_q).decode('utf-8')
+    
+    # Create DataFrame with correctly aligned data including hashes
+    df = pd.DataFrame([
+        {'Parameter': 'n', 'Encrypted Value (Hex)': hex_n[:50] + '...' if len(hex_n) > 50 else hex_n, 'Full Length': len(hex_n), 'Hash (SHA-256)': n_hash},
+        {'Parameter': 'e', 'Encrypted Value (Hex)': hex_e[:50] + '...' if len(hex_e) > 50 else hex_e, 'Full Length': len(hex_e), 'Hash (SHA-256)': e_hash},
+        {'Parameter': 'd', 'Encrypted Value (Hex)': hex_d[:50] + '...' if len(hex_d) > 50 else hex_d, 'Full Length': len(hex_d), 'Hash (SHA-256)': d_hash},
+        {'Parameter': 'p', 'Encrypted Value (Hex)': hex_p[:50] + '...' if len(hex_p) > 50 else hex_p, 'Full Length': len(hex_p), 'Hash (SHA-256)': p_hash},
+        {'Parameter': 'q', 'Encrypted Value (Hex)': hex_q[:50] + '...' if len(hex_q) > 50 else hex_q, 'Full Length': len(hex_q), 'Hash (SHA-256)': q_hash}
+    ])
+    
+    # Add message hash if available
+    if message_hash:
+        df = pd.concat([df, pd.DataFrame([{'Parameter': 'Message', 'Encrypted Value (Hex)': '', 'Full Length': '', 'Hash (SHA-256)': message_hash}])], ignore_index=True)
+    
+    # Export to Excel
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Encrypted RSA Keys"
+    
+    # Add header row
+    ws.append(["RSA Key Parameters (Encrypted with AES)"])
+    ws.append(["CAUTION: This file contains encrypted key material"])
+    ws.append(["Key ID: " + str(key_id)])
+    ws.append([])  # Empty row for spacing
+    
+    # Add data from DataFrame
+    for r in dataframe_to_rows(df, index=False, header=True):
+        ws.append(r)
+        
+    # Save workbook
+    wb.save(EXCEL_FILE)
+    print(f"🔐 Exported encrypted keys and hashes to {EXCEL_FILE}")
+
+# ✅ Retrieve and Decrypt RSA Keys
+def retrieve_rsa_key(key_id=None):
+    """Retrieve and decrypt the stored RSA keys from the database."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    if key_id:
+        cursor.execute("""
+            SELECT n, e, d, p, q, n_hash, e_hash, d_hash, p_hash, q_hash, message_hash, original_message, 
+            rsa_encrypted, rsa_des3_encrypted, rsa_des3_aes_encrypted, des3_key, des3_iv, aes_key, aes_nonce, aes_tag 
+            FROM rsa_keys WHERE id = ?
+        """, (key_id,))
+    else:
+        cursor.execute("""
+            SELECT n, e, d, p, q, n_hash, e_hash, d_hash, p_hash, q_hash, message_hash, original_message, 
+            rsa_encrypted, rsa_des3_encrypted, rsa_des3_aes_encrypted, des3_key, des3_iv, aes_key, aes_nonce, aes_tag 
+            FROM rsa_keys ORDER BY id DESC LIMIT 1
+        """)
+    
+    row = cursor.fetchone()
+    conn.close()
+
+    if row:
+        decrypted_n = bytes_to_long(aes_decrypt(row[0], AES_KEY))
+        decrypted_e = bytes_to_long(aes_decrypt(row[1], AES_KEY))
+        decrypted_d = bytes_to_long(aes_decrypt(row[2], AES_KEY))
+        decrypted_p = bytes_to_long(aes_decrypt(row[3], AES_KEY))
+        decrypted_q = bytes_to_long(aes_decrypt(row[4], AES_KEY))
+        
+        # Verify hashes to ensure integrity
+        computed_n_hash = compute_hash(decrypted_n)
+        computed_e_hash = compute_hash(decrypted_e)
+        computed_d_hash = compute_hash(decrypted_d)
+        computed_p_hash = compute_hash(decrypted_p)
+        computed_q_hash = compute_hash(decrypted_q)
+        
+        stored_n_hash, stored_e_hash, stored_d_hash, stored_p_hash, stored_q_hash = row[5:10]
+        
+        # Verify all hashes match
+        if (computed_n_hash != stored_n_hash or 
+            computed_e_hash != stored_e_hash or 
+            computed_d_hash != stored_d_hash or 
+            computed_p_hash != stored_p_hash or 
+            computed_q_hash != stored_q_hash):
+            raise ValueError("Hash verification failed! Keys may have been tampered with.")
+        
+        return {
+            'n': decrypted_n, 
+            'e': decrypted_e, 
+            'd': decrypted_d, 
+            'p': decrypted_p, 
+            'q': decrypted_q,
+            'message_hash': row[10],
+            'original_message': row[11],
+            'rsa_encrypted': row[12],
+            'rsa_des3_encrypted': row[13],
+            'rsa_des3_aes_encrypted': row[14],
+            'des3_key': row[15],
+            'des3_iv': row[16],
+            'aes_key': row[17],
+            'aes_nonce': row[18],
+            'aes_tag': row[19]
+        }
+    else:
+        raise ValueError("No RSA key found in the database!")
+
+# ✅ RSA Encryption using OAEP
+def rsa_encrypt(message, n, e):
+    rsa_key = RSA.construct((n, e))
+    cipher = PKCS1_OAEP.new(rsa_key)
+    return cipher.encrypt(message)
+
+# ✅ RSA Decryption using Correct Key Construction
+def rsa_decrypt(ciphertext, n, d, p, q):
+    # Include e in the key construction (required for proper private key format)
+    e = 65537  # Using the same e value as in key generation
+    rsa_key = RSA.construct((n, e, d, p, q))  # Correct order: n, e, d, p, q
+    cipher = PKCS1_OAEP.new(rsa_key)
+    return cipher.decrypt(ciphertext)
+
+# ✅ Sequential Decryption (AES -> 3DES -> RSA)
+def sequential_decrypt(aes_ciphertext, aes_key, aes_nonce, aes_tag, des3_key, des3_iv, n, d, p, q):
+    """Decrypt data that was encrypted using RSA -> 3DES -> AES sequence"""
+    # Step 1: AES Decryption
+    aes_cipher = AES.new(aes_key, AES.MODE_EAX, nonce=aes_nonce)
+    des3_ciphertext = aes_cipher.decrypt_and_verify(aes_ciphertext, aes_tag)
+    
+    # Step 2: 3DES Decryption
+    rsa_encrypted = des3_decrypt(des3_ciphertext, des3_key, des3_iv)
+    
+    # Step 3: RSA Decryption
+    original_message = rsa_decrypt(rsa_encrypted, n, d, p, q)
+    
+    return original_message
+
+# ✅ Verify message integrity
+def verify_message_integrity(message, stored_hash):
+    """Verify the integrity of a message by comparing its hash with the stored hash"""
+    computed_hash = compute_hash(message)
+    if computed_hash != stored_hash:
+        print(f"⚠️ WARNING: Message hash mismatch!")
+        print(f"  Stored hash: {stored_hash}")
+        print(f"  Computed hash: {computed_hash}")
+        return False
+    return True
+
+# ✅ Get User Input
+def get_user_input():
+    """Get message input from user"""
+    print("\n📝 Enter the message you want to encrypt:")
+    user_message = input("> ")
+    return user_message.encode('utf-8')
+
+# ✅ Main Execution
+if __name__ == "__main__":
+    print("🔐 Initializing Database...")
+    initialize_db()
+
+    print("🔐 Generating and Storing RSA Keys...")
+    # Get user input first
+    message = get_user_input()
+    print(f"\n🔹 Original Message: {message.decode()}")
+    
+    # Generate keys and get the key components
+    key_id, n, e, d, p, q = generate_and_store_rsa_key(message)
+    print(f"🔑 Key Generated with ID: {key_id}")
+
+    try:
+        # Retrieve the saved data
+        key_data = retrieve_rsa_key(key_id)
+        
+        # Display encryption stages
+        print("\n🔹 Encryption Stages:")
+        if key_data['rsa_encrypted']:
+            print(f"🔒 Stage 1 (RSA): {key_data['rsa_encrypted'].hex()[:50]}..." 
+                  if len(key_data['rsa_encrypted'].hex()) > 50 
+                  else f"🔒 Stage 1 (RSA): {key_data['rsa_encrypted'].hex()}")
+            
+        if key_data['rsa_des3_encrypted']:
+            print(f"🔒 Stage 2 (3DES): {key_data['rsa_des3_encrypted'].hex()[:50]}..." 
+                  if len(key_data['rsa_des3_encrypted'].hex()) > 50 
+                  else f"🔒 Stage 2 (3DES): {key_data['rsa_des3_encrypted'].hex()}")
+            
+        if key_data['rsa_des3_aes_encrypted']:
+            print(f"🔒 Stage 3 (AES): {key_data['rsa_des3_aes_encrypted'].hex()[:50]}..." 
+                  if len(key_data['rsa_des3_aes_encrypted'].hex()) > 50 
+                  else f"🔒 Stage 3 (AES): {key_data['rsa_des3_aes_encrypted'].hex()}")
+            
+        # Sequential decryption
+        if (key_data['rsa_des3_aes_encrypted'] and key_data['aes_key'] and 
+            key_data['des3_key'] and key_data['rsa_encrypted']):
+            
+            print("\n🔐 Performing Sequential Decryption (AES -> 3DES -> RSA)...")
+            
+            decrypted_message = sequential_decrypt(
+                key_data['rsa_des3_aes_encrypted'],
+                key_data['aes_key'],
+                key_data['aes_nonce'],
+                key_data['aes_tag'],
+                key_data['des3_key'],
+                key_data['des3_iv'],
+                key_data['n'],
+                key_data['d'],
+                key_data['p'],
+                key_data['q']
+            )
+            
+            print(f"🔓 Decrypted Message: {decrypted_message.decode()}")
+            
+            # Verify message hash
+            if key_data['message_hash']:
+                is_valid = verify_message_integrity(decrypted_message, key_data['message_hash'])
+                print(f"✅ Message integrity verification: {'Passed' if is_valid else 'Failed'}")
+        
+        print(f"\n✅ Excel file with encrypted keys created: {EXCEL_FILE}")
+        print("📋 Note: The keys in the Excel file are in encrypted format for security.")
+        
+    except Exception as e:
+        print(f"❌ Error during encryption/decryption: {str(e)}")
